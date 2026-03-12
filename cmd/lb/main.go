@@ -23,24 +23,25 @@ const (
 
 // Backend holds the data about a server
 type Backend struct {
-	URL          *url.URL
-	Alive        bool
-	mux          sync.RWMutex
-	ReverseProxy *httputil.ReverseProxy
+	URL            *url.URL
+	Alive          bool
+	Mutex          sync.RWMutex
+	ReverseProxy   *httputil.ReverseProxy
+	NumConnections int64
 }
 
 // SetAlive for this backend
 func (b *Backend) SetAlive(alive bool) {
-	b.mux.Lock()
+	b.Mutex.Lock()
 	b.Alive = alive
-	b.mux.Unlock()
+	b.Mutex.Unlock()
 }
 
 // IsAlive returns true when backend is alive
 func (b *Backend) IsAlive() (alive bool) {
-	b.mux.RLock()
+	b.Mutex.RLock()
 	alive = b.Alive
-	b.mux.RUnlock()
+	b.Mutex.RUnlock()
 	return
 }
 
@@ -70,6 +71,16 @@ func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
 	}
 }
 
+// SubtractOneBackendConnection reduces num connections of one backend
+func (s *ServerPool) SubtractOneBackendConnection(backendUrl *url.URL) {
+	for _, b := range s.backends {
+		if b.URL.String() == backendUrl.String() {
+			atomic.AddInt64(&b.NumConnections, int64(-1))
+			break
+		}
+	}
+}
+
 // GetNextPeer returns next active peer to take a connection
 func (s *ServerPool) GetNextPeer() *Backend {
 	// loop entire backends to find out an Alive backend
@@ -85,6 +96,21 @@ func (s *ServerPool) GetNextPeer() *Backend {
 		}
 	}
 	return nil
+}
+
+// GetLeastConnectedPeer returns peer w/least connections
+func (s *ServerPool) GetLeastConnectedPeer() *Backend {
+	var best *Backend
+	for _, b := range s.backends {
+		if !b.IsAlive() {
+			continue
+		}
+		// pick up the first element we see as a backend, and if we see a better one, choose it
+		if best == nil || b.NumConnections < best.NumConnections {
+			best = b
+		}
+	}
+	return best
 }
 
 // HealthCheck pings the backends and update the status
@@ -116,6 +142,15 @@ func GetRetryFromContext(r *http.Request) int {
 	return 0
 }
 
+// logConnectionSnapshot prints current NumConnections for every backend
+func (s *ServerPool) logConnectionSnapshot(label string) {
+	parts := make([]string, len(s.backends))
+	for i, b := range s.backends {
+		parts[i] = fmt.Sprintf("%s=%d", b.URL.Host, atomic.LoadInt64(&b.NumConnections))
+	}
+	log.Printf("[connections] %s | %s", label, strings.Join(parts, "  "))
+}
+
 // lb load balances the incoming request
 func lb(w http.ResponseWriter, r *http.Request) {
 	attempts := GetAttemptsFromContext(r)
@@ -125,10 +160,17 @@ func lb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peer := serverPool.GetNextPeer()
+	peer := serverPool.GetLeastConnectedPeer()
 	if peer != nil {
+		conns := atomic.AddInt64(&peer.NumConnections, int64(1))
+		log.Printf("[acquire] %s  active=%d", peer.URL.Host, conns)
+		serverPool.logConnectionSnapshot("after acquire")
+
 		peer.ReverseProxy.ServeHTTP(w, r)
-		log.Printf("LB: Sucess! Request served by: %s", peer.URL)
+
+		conns = atomic.AddInt64(&peer.NumConnections, int64(-1))
+		log.Printf("[release] %s  active=%d", peer.URL.Host, conns)
+		serverPool.logConnectionSnapshot("after release")
 		return
 	}
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
