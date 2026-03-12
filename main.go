@@ -1,3 +1,4 @@
+// credit to https://github.com/kasvith/simplelb/
 package main
 
 import (
