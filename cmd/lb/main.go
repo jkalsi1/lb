@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -45,10 +48,52 @@ func (b *Backend) IsAlive() (alive bool) {
 	return
 }
 
+// Strategy selects the next backend from a pool.
+type Strategy interface {
+	Next(backends []*Backend) *Backend
+}
+
+// RoundRobin cycles through backends in order, skipping dead ones.
+type RoundRobin struct {
+	current uint64
+}
+
+func (rr *RoundRobin) Next(backends []*Backend) *Backend {
+	next := int(atomic.AddUint64(&rr.current, uint64(1)) % uint64(len(backends)))
+	l := len(backends) + next
+	for i := next; i < l; i++ {
+		idx := i % len(backends)
+		if backends[idx].IsAlive() {
+			if i != next {
+				atomic.StoreUint64(&rr.current, uint64(idx))
+			}
+			return backends[idx]
+		}
+	}
+	return nil
+}
+
+// LeastConnections picks the alive backend with the fewest active connections.
+type LeastConnections struct{}
+
+func (lc *LeastConnections) Next(backends []*Backend) *Backend {
+	var best *Backend
+	for _, b := range backends {
+		if !b.IsAlive() {
+			continue
+		}
+		if best == nil || b.NumConnections < best.NumConnections {
+			best = b
+		}
+	}
+	return best
+}
+
 // ServerPool holds information about reachable backends
 type ServerPool struct {
 	backends []*Backend
 	current  uint64
+	strategy Strategy
 }
 
 // AddBackend to the server pool
@@ -160,7 +205,7 @@ func lb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peer := serverPool.GetLeastConnectedPeer()
+	peer := serverPool.strategy.Next(serverPool.backends)
 	if peer != nil {
 		conns := atomic.AddInt64(&peer.NumConnections, int64(1))
 		log.Printf("[acquire] %s  active=%d", peer.URL.Host, conns)
@@ -188,14 +233,20 @@ func isBackendAlive(u *url.URL) bool {
 	return true
 }
 
-// healthCheck runs a routine for check status of the backends every 2 mins
-func healthCheck() {
+// healthCheck runs a routine for check status of the backends every 2 mins.
+// It stops when ctx is cancelled.
+func healthCheck(ctx context.Context) {
 	t := time.NewTicker(time.Minute * 2)
+	defer t.Stop()
 	for {
-		<-t.C
-		log.Println("Starting health check...")
-		serverPool.HealthCheck()
-		log.Println("Health check completed")
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			log.Println("Starting health check...")
+			serverPool.HealthCheck()
+			log.Println("Health check completed")
+		}
 	}
 }
 
@@ -204,12 +255,21 @@ var serverPool ServerPool
 func main() {
 	var serverList string
 	var port int
+	var strategyName string
 	flag.StringVar(&serverList, "backends", "", "Load balanced backends, use commas to separate")
 	flag.IntVar(&port, "port", 3030, "Port to serve")
+	flag.StringVar(&strategyName, "strategy", "leastconn", "Load balancing strategy: roundrobin or leastconn")
 	flag.Parse()
 
 	if len(serverList) == 0 {
 		log.Fatal("Please provide one or more backends to load balance")
+	}
+
+	switch strategyName {
+	case "roundrobin":
+		serverPool.strategy = &RoundRobin{}
+	default:
+		serverPool.strategy = &LeastConnections{}
 	}
 
 	// parse servers
@@ -249,17 +309,36 @@ func main() {
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
 
-	// create http server
-	server := http.Server{
+	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: http.HandlerFunc(lb),
 	}
 
-	// start health checking
-	go healthCheck()
+	// Derive a context for the health-check goroutine so it stops on shutdown.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	log.Printf("Load Balancer started at :%d\n", port)
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatal(err)
+	go healthCheck(ctx)
+
+	go func() {
+		log.Printf("Load Balancer started at :%d\n", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+
+	log.Println("Shutting down...")
+	cancel() // stop health check goroutine
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
 	}
+	log.Println("Server exited cleanly")
 }
