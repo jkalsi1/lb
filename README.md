@@ -1,8 +1,8 @@
-# go-lb
+# load-balancer (Go)
 
 A Layer-7 HTTP load balancer written in Go, with pluggable routing strategies, a per-backend circuit breaker, and graceful shutdown.
 
-### Credit to: https://github.com/kasvith/simplelb/
+Credit to: https://github.com/kasvith/simplelb/
 
 ## Features
 
