@@ -2,6 +2,8 @@
 
 A Layer-7 HTTP load balancer written in Go, with pluggable routing strategies, a per-backend circuit breaker, and graceful shutdown.
 
+### Credit to: https://github.com/kasvith/simplelb/
+
 ## Features
 
 - **Round-robin** and **least-connections** routing strategies
@@ -26,11 +28,11 @@ go build -o lb ./cmd/lb
 
 ### Flags
 
-| Flag        | Default      | Description                                    |
-|-------------|--------------|------------------------------------------------|
-| `-backends` | *(required)* | Comma-separated list of backend URLs           |
-| `-port`     | `3030`       | Port the load balancer listens on              |
-| `-strategy` | `leastconn`  | Routing strategy: `roundrobin` or `leastconn`  |
+| Flag        | Default      | Description                                   |
+| ----------- | ------------ | --------------------------------------------- |
+| `-backends` | _(required)_ | Comma-separated list of backend URLs          |
+| `-port`     | `3030`       | Port the load balancer listens on             |
+| `-strategy` | `leastconn`  | Routing strategy: `roundrobin` or `leastconn` |
 
 ## Architecture
 
@@ -56,17 +58,17 @@ Client ───► │             lb (HTTP handler)            │
 Each backend runs its own circuit breaker independently.
 
 | State      | Behaviour                                                                 |
-|------------|---------------------------------------------------------------------------|
+| ---------- | ------------------------------------------------------------------------- |
 | `Closed`   | Normal — requests are forwarded                                           |
 | `Open`     | Tripped — requests are immediately rejected (503); reopens after 5 s      |
 | `HalfOpen` | One probe request is allowed; success closes the circuit, failure reopens |
 
 **Thresholds (tunable via source):**
 
-| Variable            | Value | Meaning                                          |
-|---------------------|-------|--------------------------------------------------|
-| `FAILURE_THRESHOLD` | `20`  | Consecutive proxy errors before tripping         |
-| `FAILURE_TIMEOUT`   | `5 s` | How long the circuit stays open before probing   |
+| Variable            | Value | Meaning                                        |
+| ------------------- | ----- | ---------------------------------------------- |
+| `FAILURE_THRESHOLD` | `20`  | Consecutive proxy errors before tripping       |
+| `FAILURE_TIMEOUT`   | `5 s` | How long the circuit stays open before probing |
 
 ### Connection Pooling
 
@@ -124,15 +126,15 @@ Measured with `hey` against two `quickserver` backends on localhost (Apple M1):
 hey -n 500000 -c 200 http://localhost:3030/
 ```
 
-| Metric              | Result         |
-|---------------------|----------------|
-| Total requests      | 500,000        |
-| Errors              | 0              |
-| Throughput          | ~17,855 req/s  |
-| p50 latency         | 10.8 ms        |
-| p95 latency         | 21.6 ms        |
-| p99 latency         | 30.9 ms        |
-| Slowest             | 77.3 ms        |
+| Metric         | Result        |
+| -------------- | ------------- |
+| Total requests | 500,000       |
+| Errors         | 0             |
+| Throughput     | ~17,855 req/s |
+| p50 latency    | 10.8 ms       |
+| p95 latency    | 21.6 ms       |
+| p99 latency    | 30.9 ms       |
+| Slowest        | 77.3 ms       |
 
 The gap between the benchmark ceiling (~234k req/s) and the observed throughput
 (~18k req/s) is expected: in the live test, each request makes a real round-trip
