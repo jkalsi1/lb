@@ -40,7 +40,7 @@ func newTestBackend(t *testing.T, handler http.HandlerFunc) *Backend {
 	}
 	return &Backend{
 		URL:          u,
-		Alive:        true,
+		State:        Closed,
 		ReverseProxy: httputil.NewSingleHostReverseProxy(u),
 	}
 }
@@ -226,7 +226,7 @@ func TestHealthCheckRecovery(t *testing.T) {
 	uA, _ := url.Parse(tsA.URL)
 	backendA := &Backend{
 		URL:          uA,
-		Alive:        true,
+		State:        Closed,
 		ReverseProxy: httputil.NewSingleHostReverseProxy(uA),
 	}
 
@@ -355,7 +355,7 @@ func nopBackend(host string) *Backend {
 		Director:  func(r *http.Request) { r.URL.Scheme = "http"; r.URL.Host = host },
 		Transport: nopTransport{},
 	}
-	return &Backend{URL: u, Alive: true, ReverseProxy: proxy}
+	return &Backend{URL: u, State: Closed, ReverseProxy: proxy}
 }
 
 func BenchmarkLBThroughput(b *testing.B) {

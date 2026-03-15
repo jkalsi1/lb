@@ -19,32 +19,84 @@ import (
 	"time"
 )
 
+var FAILURE_THRESHOLD = 20
+
+const FAILURE_TIMEOUT = (5 * time.Second)
+
 const (
 	Attempts int = iota
 	Retry
 )
 
+type CircuitState int
+
+// CircuitState enum
+const (
+	Closed   CircuitState = iota // good to send requests
+	Open                         // don't send requests
+	HalfOpen                     // send ONE request (probe)
+)
+
 // Backend holds the data about a server
 type Backend struct {
-	URL            *url.URL
-	Alive          bool
-	Mutex          sync.RWMutex
-	ReverseProxy   *httputil.ReverseProxy
-	NumConnections int64
+	URL              *url.URL
+	Mutex            sync.Mutex
+	ReverseProxy     *httputil.ReverseProxy
+	NumConnections   int64
+	State            CircuitState
+	FailureCount     int64
+	OpenUntil        time.Time
+	HalfOpenInFlight bool
+}
+
+// RecordOneFailure increments failure count for a backend.
+// If threshold exceeded, trips circuit and sets openUntil.
+func (b *Backend) RecordOneFailure() {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
+	b.FailureCount++
+	if b.FailureCount >= int64(FAILURE_THRESHOLD) {
+		b.State = Open
+		b.OpenUntil = time.Now().Add(FAILURE_TIMEOUT)
+		b.FailureCount = 0
+	}
+}
+
+// RecordSuccess resets failureCount to 0 and sets circuit state to Closed
+
+func (b *Backend) RecordSuccess() {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
+	b.FailureCount = 0
+	if b.State == HalfOpen {
+		b.State = Closed
+	}
 }
 
 // SetAlive for this backend
-func (b *Backend) SetAlive(alive bool) {
+func (b *Backend) SetAlive(state CircuitState) {
 	b.Mutex.Lock()
-	b.Alive = alive
+	b.State = state
 	b.Mutex.Unlock()
 }
 
 // IsAlive returns true when backend is alive
 func (b *Backend) IsAlive() (alive bool) {
-	b.Mutex.RLock()
-	alive = b.Alive
-	b.Mutex.RUnlock()
+	b.Mutex.Lock()
+	switch b.State {
+	case Closed:
+		alive = true
+	case Open:
+		if time.Now().After(b.OpenUntil) {
+			alive = true
+			b.State = HalfOpen
+		} else {
+			alive = false
+		}
+	case HalfOpen:
+		alive = !b.HalfOpenInFlight
+	}
+	b.Mutex.Unlock()
 	return
 }
 
@@ -107,10 +159,14 @@ func (s *ServerPool) NextIndex() int {
 }
 
 // MarkBackendStatus changes a status of a backend
-func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
+func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, state CircuitState) {
 	for _, b := range s.backends {
 		if b.URL.String() == backendUrl.String() {
-			b.SetAlive(alive)
+			if state == Open {
+				b.RecordOneFailure()
+			} else {
+				b.RecordSuccess()
+			}
 			break
 		}
 	}
@@ -158,15 +214,23 @@ func (s *ServerPool) GetLeastConnectedPeer() *Backend {
 	return best
 }
 
-// HealthCheck pings the backends and update the status
+// HealthCheck pings the backends and updates circuit state accordingly.
 func (s *ServerPool) HealthCheck() {
 	for _, b := range s.backends {
+		reachable := isBackendAlive(b.URL)
+		b.Mutex.Lock()
+		if reachable == Closed {
+			b.State = Closed
+			b.FailureCount = 0
+		} else {
+			b.State = Open
+			b.OpenUntil = time.Now().Add(FAILURE_TIMEOUT)
+		}
 		status := "up"
-		alive := isBackendAlive(b.URL)
-		b.SetAlive(alive)
-		if !alive {
+		if b.State == Open {
 			status = "down"
 		}
+		b.Mutex.Unlock()
 		log.Printf("%s [%s]\n", b.URL, status)
 	}
 }
@@ -207,11 +271,26 @@ func lb(w http.ResponseWriter, r *http.Request) {
 
 	peer := serverPool.strategy.Next(serverPool.backends)
 	if peer != nil {
+		// If this backend is in HalfOpen state, mark the probe as in-flight so
+		// IsAlive() blocks additional requests until the probe completes.
+		peer.Mutex.Lock()
+		isProbe := peer.State == HalfOpen
+		if isProbe {
+			peer.HalfOpenInFlight = true
+		}
+		peer.Mutex.Unlock()
+
 		conns := atomic.AddInt64(&peer.NumConnections, int64(1))
 		log.Printf("[acquire] %s  active=%d", peer.URL.Host, conns)
 		serverPool.logConnectionSnapshot("after acquire")
 
 		peer.ReverseProxy.ServeHTTP(w, r)
+
+		if isProbe {
+			peer.Mutex.Lock()
+			peer.HalfOpenInFlight = false
+			peer.Mutex.Unlock()
+		}
 
 		conns = atomic.AddInt64(&peer.NumConnections, int64(-1))
 		log.Printf("[release] %s  active=%d", peer.URL.Host, conns)
@@ -222,15 +301,15 @@ func lb(w http.ResponseWriter, r *http.Request) {
 }
 
 // isAlive checks whether a backend is Alive by establishing a TCP connection
-func isBackendAlive(u *url.URL) bool {
+func isBackendAlive(u *url.URL) CircuitState {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
 	if err != nil {
 		log.Println("Site unreachable, error: ", err)
-		return false
+		return Open
 	}
 	defer conn.Close()
-	return true
+	return Closed
 }
 
 // healthCheck runs a routine for check status of the backends every 2 mins.
@@ -280,19 +359,37 @@ func main() {
 			log.Fatal(err)
 		}
 
+		// Use a shared transport per backend so idle connections are reused
+		// across concurrent requests instead of being closed after each one.
+		// Without this, DefaultTransport keeps only 2 idle conns per host,
+		// causing ~198 connections to close (TIME_WAIT) after every 200-concurrency
+		// wave and quickly exhausting the process's file-descriptor limit.
+		transport := &http.Transport{
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 300,
+			IdleConnTimeout:     90 * time.Second,
+		}
+
 		proxy := httputil.NewSingleHostReverseProxy(serverUrl)
+		proxy.Transport = transport
+		// ModifyResponse is called on every successful (non-error) response.
+		// Record the success so the circuit breaker can close a half-open circuit.
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			serverPool.MarkBackendStatus(serverUrl, Closed)
+			return nil
+		}
 		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
 			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
 			retries := GetRetryFromContext(request)
 			if retries < 3 {
-				<-time.After(10 * time.Millisecond)
+				<-time.After(10 * time.Millisecond) // sleep 10ms
 				ctx := context.WithValue(request.Context(), Retry, retries+1)
 				proxy.ServeHTTP(writer, request.WithContext(ctx))
 				return
 			}
 
 			// after 3 retries, mark this backend as down
-			serverPool.MarkBackendStatus(serverUrl, false)
+			serverPool.MarkBackendStatus(serverUrl, Open)
 
 			// if the same request routing for few attempts with different backends, increase the count
 			attempts := GetAttemptsFromContext(request)
@@ -303,7 +400,7 @@ func main() {
 
 		serverPool.AddBackend(&Backend{
 			URL:          serverUrl,
-			Alive:        true,
+			State:        Closed,
 			ReverseProxy: proxy,
 		})
 		log.Printf("Configured server: %s\n", serverUrl)

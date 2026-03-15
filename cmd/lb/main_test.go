@@ -13,7 +13,13 @@ import (
 
 func makeBackend(rawURL string, alive bool, conns int64) *Backend {
 	u, _ := url.Parse(rawURL)
-	b := &Backend{URL: u, Alive: alive}
+	state := Closed
+	var openUntil time.Time
+	if !alive {
+		state = Open
+		openUntil = time.Now().Add(24 * time.Hour) // keep circuit open for test duration
+	}
+	b := &Backend{URL: u, State: state, OpenUntil: openUntil}
 	atomic.StoreInt64(&b.NumConnections, conns)
 	return b
 }
